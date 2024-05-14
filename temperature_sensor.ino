@@ -8,7 +8,7 @@
 /* TODOs:
 Sleep for a given time
 read i2c sensor, preferrably with i2c lp
-where to store temperature data while sleeping
+Store temperature in RTC memory
 Use TLS to encrypt mqtt connection
 Use cert to authentify device to broker
 Check how to configure wifi easily?
@@ -32,7 +32,20 @@ const char MQTT_PASSWORD[] = "";                        // CHANGE IT IF REQUIRED
 const char PUBLISH_TOPIC[] = "ecoduboiron-arduino-001/sensors-values";  
 const char SUBSCRIBE_TOPIC[] = "ecoduboiron-arduino-001/sensors-command";
 
-const int PUBLISH_INTERVAL = 5000;  // 5 seconds
+const int MEASURE_INTERVAL = 5000;  // 5 seconds
+const int PUBLISH_INTERVAL = 20000;  // 20 seconds
+
+
+
+typedef struct{
+  unsigned int timestamp;
+  float temperature;
+  float humidity;
+} measurement_t;
+
+// 16K (byte I suppose) of memory is available and kept during hibernate
+RTC_DATA_ATTR measurement_t measures[1000];
+RTC_DATA_ATTR unsigned int measure_count=0;
 
 #define I2C_SDA 19
 #define I2C_SCL 20
@@ -51,9 +64,8 @@ MQTTClient mqtt = MQTTClient(256);
 static char errorMessage[64];
 static int16_t error;
 
-unsigned long lastPublishTime = 0;
+RTC_DATA_ATTR unsigned long lastPublishTime = 0;
 SensirionI2cSht4x sensor;
-
 
 int LedPin = 15;
 void setup() {
@@ -63,6 +75,13 @@ void setup() {
   Serial.println();
 
   i2c_init();
+
+  struct timeval tv_now;
+  gettimeofday(&tv_now, NULL);
+  int64_t time_us = (int64_t)tv_now.tv_sec * 1000000L + (int64_t)tv_now.tv_usec;
+  Serial.print("Time:");
+  Serial.println(tv_now.tv_sec);
+
 
   wifi_scan();
 
@@ -245,30 +264,36 @@ void loop()
 {
   mqtt.loop();
 
-  float aTemperature = 0.0;
-  float aHumidity = 0.0;
+  measurement_t *measure = &measures[measure_count++];
 
-  error = sensor.measureLowestPrecision(aTemperature, aHumidity);
+  error = sensor.measureLowestPrecision(measure->temperature, measure->humidity);
   if (error != NO_ERROR) 
   {
       Serial.print("Error trying to execute measureLowestPrecision(): ");
       errorToString(error, errorMessage, sizeof errorMessage);
       Serial.println(errorMessage);
-      return;
   }
-  Serial.print("aTemperature: ");
-  Serial.print(aTemperature);
-  Serial.print("\t");
-  Serial.print("aHumidity: ");
-  Serial.println(aHumidity);
-
-
-  if (millis() - lastPublishTime > PUBLISH_INTERVAL) 
+  else
   {
-    sendToMQTT(aTemperature, aHumidity);
-    lastPublishTime = millis();
+    Serial.print("Temperature: ");
+    Serial.print(measure->temperature);
+    Serial.print("\t");
+    Serial.print("Humidity: ");
+    Serial.println(measure->humidity);
+
+    if (millis() - lastPublishTime > PUBLISH_INTERVAL) 
+    {
+      sendToMQTT(measure->temperature, measure->humidity);
+      lastPublishTime = millis();
+    }
   }
 
-  delay(PUBLISH_INTERVAL);
+  Serial.print("Sleeping for seconds: ");
+  Serial.println(MEASURE_INTERVAL/1000);
+
+  esp_sleep_enable_timer_wakeup(MEASURE_INTERVAL * 1000);
+ 
+  esp_deep_sleep_start();
+
 
 }
