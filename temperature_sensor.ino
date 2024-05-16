@@ -6,9 +6,7 @@
 #include <Wire.h>
 
 /* TODOs:
-Sleep for a given time
 read i2c sensor, preferrably with i2c lp
-Store temperature in RTC memory
 Use TLS to encrypt mqtt connection
 Use cert to authentify device to broker
 Check how to configure wifi easily?
@@ -32,8 +30,8 @@ const char MQTT_PASSWORD[] = "";                        // CHANGE IT IF REQUIRED
 const char PUBLISH_TOPIC[] = "ecoduboiron-arduino-001/sensors-values";  
 const char SUBSCRIBE_TOPIC[] = "ecoduboiron-arduino-001/sensors-command";
 
-const int MEASURE_INTERVAL = 5000;  // 5 seconds
-const int PUBLISH_INTERVAL = 20000;  // 20 seconds
+const int MEASURE_INTERVAL = 5;  // 5 seconds
+const int PUBLISH_INTERVAL = 20;  // 20 seconds
 
 
 
@@ -65,10 +63,29 @@ static char errorMessage[64];
 static int16_t error;
 
 RTC_DATA_ATTR unsigned long lastPublishTime = 0;
+RTC_DATA_ATTR unsigned long lastMeasureTime = 0;
 SensirionI2cSht4x sensor;
 
 int LedPin = 15;
-void setup() {
+
+void print_wakeup_reason()
+{
+  esp_sleep_wakeup_cause_t wakeup_reason;
+
+  wakeup_reason = esp_sleep_get_wakeup_cause();
+
+  switch(wakeup_reason){
+    case ESP_SLEEP_WAKEUP_EXT0 : Serial.println("Wakeup caused by external signal using RTC_IO"); break;
+    case ESP_SLEEP_WAKEUP_EXT1 : Serial.println("Wakeup caused by external signal using RTC_CNTL"); break;
+    case ESP_SLEEP_WAKEUP_TIMER : Serial.println("Wakeup caused by timer"); break;
+    case ESP_SLEEP_WAKEUP_TOUCHPAD : Serial.println("Wakeup caused by touchpad"); break;
+    case ESP_SLEEP_WAKEUP_ULP : Serial.println("Wakeup caused by ULP program"); break;
+    default : Serial.printf("Wakeup was not caused by deep sleep: %d\n",wakeup_reason); break;
+  }
+}
+
+
+void setup(){
   pinMode(LedPin, OUTPUT);
 
   Serial.begin(115200);
@@ -82,31 +99,87 @@ void setup() {
   Serial.print("Time:");
   Serial.println(tv_now.tv_sec);
 
+  print_wakeup_reason();
 
-  wifi_scan();
 
-  Serial.print("Arduino - Attempting to connect to SSID: ");
-  Serial.println(WIFI_SSID);
-  // Connect to WPA/WPA2 network. Change this line if using open or WEP network:
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED)
+  if (tv_now.tv_sec - lastMeasureTime > MEASURE_INTERVAL) 
   {
-      delay(500);
-      Serial.println(WiFi.status());
+    measurement_t *measure = &measures[measure_count++];
+
+    error = sensor.measureLowestPrecision(measure->temperature, measure->humidity);
+    if (error != NO_ERROR) 
+    {
+        Serial.print("Error trying to execute measureLowestPrecision(): ");
+        errorToString(error, errorMessage, sizeof errorMessage);
+        Serial.println(errorMessage);
+    }
+    else
+    {
+      measure->timestamp = tv_now.tv_sec;
+      Serial.print("Measure: ");
+      Serial.println(measure_count);
+      Serial.print("Temperature: ");
+      Serial.print(measure->temperature);
+      Serial.print("\t");
+      Serial.print("Humidity: ");
+      Serial.println(measure->humidity);
+
+    }
+    lastMeasureTime = tv_now.tv_sec;
   }
 
-  //digitalWrite(LedPin, HIGH);
-  //Serial.println("Toggle!");
+
+ if (tv_now.tv_sec - lastPublishTime > PUBLISH_INTERVAL) 
+  {  
+    //wifi_scan();
+
+    Serial.print("Arduino - Attempting to connect to SSID: ");
+    Serial.println(WIFI_SSID);
+    // Connect to WPA/WPA2 network. Change this line if using open or WEP network:
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    while (WiFi.status() != WL_CONNECTED)
+    {
+        delay(500);
+        Serial.println(WiFi.status());
+    }
+
+    //digitalWrite(LedPin, HIGH);
+    //Serial.println("Toggle!");
 
 
-  Serial.println("WiFi connected!");
+    Serial.println("WiFi connected!");
 
-  // print your board's IP address:
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
+    // print your board's IP address:
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
 
-  connectToMQTT();
-  Serial.println("WiFi connected!");
+    connectToMQTT();
+
+    mqtt.loop(); //TODO: Is it needed
+    
+    Serial.print("Send measures: ");
+    Serial.println(measure_count);
+
+    for(int i=0; i< measure_count; i++)
+    {
+      sendToMQTT(measures[i]);
+    }
+    //TODO: Handle failure to send
+    measure_count = 0;
+    lastPublishTime = tv_now.tv_sec;
+
+  }
+
+
+
+  // Serial.print("Sleeping for seconds: ");
+  // Serial.println(MEASURE_INTERVAL/1000);
+
+  // esp_sleep_enable_timer_wakeup(MEASURE_INTERVAL * 1000);
+ 
+  // esp_deep_sleep_start();
+
+
 }
 
 
@@ -242,11 +315,17 @@ void messageHandler(String &topic, String &payload)
   Serial.println(payload);
 }
 
-void sendToMQTT(float aTemperature, float aHumidity) 
+void sendToMQTT(measurement_t measure) 
 {
   StaticJsonDocument<200> message;
-  message["timestamp"] = millis();
-  message["data"] = aTemperature;  // Or you can read data from other sensors
+  Serial.println("Sending measure");
+  Serial.println(measure.timestamp);
+  message["timestamp"] = measure.timestamp;
+
+  JsonArray data = message.createNestedArray("data");
+  data.add(measure.temperature);
+  data.add(measure.humidity);
+
   char messageBuffer[512];
   serializeJson(message, messageBuffer);
 
@@ -264,34 +343,10 @@ void loop()
 {
   mqtt.loop();
 
-  measurement_t *measure = &measures[measure_count++];
-
-  error = sensor.measureLowestPrecision(measure->temperature, measure->humidity);
-  if (error != NO_ERROR) 
-  {
-      Serial.print("Error trying to execute measureLowestPrecision(): ");
-      errorToString(error, errorMessage, sizeof errorMessage);
-      Serial.println(errorMessage);
-  }
-  else
-  {
-    Serial.print("Temperature: ");
-    Serial.print(measure->temperature);
-    Serial.print("\t");
-    Serial.print("Humidity: ");
-    Serial.println(measure->humidity);
-
-    if (millis() - lastPublishTime > PUBLISH_INTERVAL) 
-    {
-      sendToMQTT(measure->temperature, measure->humidity);
-      lastPublishTime = millis();
-    }
-  }
-
   Serial.print("Sleeping for seconds: ");
-  Serial.println(MEASURE_INTERVAL/1000);
+  Serial.println(MEASURE_INTERVAL);
 
-  esp_sleep_enable_timer_wakeup(MEASURE_INTERVAL * 1000);
+  esp_sleep_enable_timer_wakeup(MEASURE_INTERVAL * 1000 * 1000);
  
   esp_deep_sleep_start();
 
